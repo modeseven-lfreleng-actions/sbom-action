@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -20,26 +20,42 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Test SBOM generation against real projects ###
+  test-projects:
+    name: "Test: ${{ matrix.name }}"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Go fixture (test-go-project)"
+            repository: "lfreleng-actions/test-go-project"
+            ref: "a77c5ec773edc266ddcc3c1d1c306e7bb3f12c30"
+            path_prefix: "test-project"
+          - name: "Node fixture (test-node-project)"
+            repository: "lfreleng-actions/test-node-project"
+            ref: "89cc7f156c88afa1855087b00ac0dce886e7b0f3"
+            path_prefix: "test-project"
+          - name: "Go monorepo module (onap/multicloud-k8s)"
+            repository: "onap/multicloud-k8s"
+            ref: "5c3b1a96811024e65b0977305b6d6737a6e2d453"
+            path_prefix: "test-project/src/k8splugin"
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@aa81113fe43792f29f939c79ea47a04801cf5342' # v0.4.1
 
       # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
+      - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -50,41 +66,310 @@ jobs:
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+      - name: "Checkout test project: ${{ matrix.repository }}"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: test-project
+          persist-credentials: false
 
       - name: "Running local action: ${{ github.repository }}"
+        id: sbom
         uses: ./
         with:
-          input: "test input 💬"
+          path_prefix: ${{ matrix.path_prefix }}
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Verify SBOM outputs"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          SBOM_JSON_PATH: ${{ steps.sbom.outputs.sbom_json_path }}
+          SBOM_XML_PATH: ${{ steps.sbom.outputs.sbom_xml_path }}
+          COMPONENT_COUNT: ${{ steps.sbom.outputs.component_count }}
+          BACKEND: ${{ steps.sbom.outputs.backend }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Verify SBOM outputs
+          errors=0
+          if [ ! -f "${SBOM_JSON_PATH}" ]; then
+            echo "JSON SBOM not found: ${SBOM_JSON_PATH} ❌"
+            errors=1
+          fi
+          if [ ! -f "${SBOM_XML_PATH}" ]; then
+            echo "XML SBOM not found: ${SBOM_XML_PATH} ❌"
+            errors=1
+          fi
+          if ! jq -e '.bomFormat == "CycloneDX"' \
+            "${SBOM_JSON_PATH}" > /dev/null; then
+            echo "JSON SBOM is not CycloneDX ❌"
+            errors=1
+          fi
+          if [ -z "${COMPONENT_COUNT}" ] || \
+            [ "${COMPONENT_COUNT}" -lt 1 ]; then
+            echo "Component count not positive: ${COMPONENT_COUNT} ❌"
+            errors=1
+          fi
+          if [ "${BACKEND}" != "syft" ]; then
+            echo "Unexpected backend output: ${BACKEND} ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "SBOM verification failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "SBOM verified: ${COMPONENT_COUNT} components ✅"
+          echo "SBOM verified: ${COMPONENT_COUNT} components ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test format selection, scoping and output placement ###
+  test-options:
+    name: "Test: formats, scoping and output options"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          invalid_input: "Some garbage"
+          config: '@aa81113fe43792f29f939c79ea47a04801cf5342' # v0.4.1
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test project: lfreleng-actions/test-node-project"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: lfreleng-actions/test-node-project
+          ref: 89cc7f156c88afa1855087b00ac0dce886e7b0f3
+          path: test-project
+          persist-credentials: false
+
+      - name: "Running local action: JSON only, custom placement"
+        id: json-only
+        uses: ./
+        with:
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: custom-sbom
+          output_directory: sbom-output
+
+      - name: "Running local action: XML only"
+        id: xml-only
+        uses: ./
+        with:
+          path_prefix: test-project
+          sbom_format: xml
+
+      - name: "Running local action: development dependencies"
+        id: with-dev
+        uses: ./
+        with:
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-with-dev
+          include_dev: 'true'
+
+      - name: "Verify format selection and scoping behaviour"
         shell: bash
+        env:
+          JSON_ONLY_JSON: ${{ steps.json-only.outputs.sbom_json_path }}
+          JSON_ONLY_XML: ${{ steps.json-only.outputs.sbom_xml_path }}
+          JSON_ONLY_COUNT: ${{ steps.json-only.outputs.component_count }}
+          XML_ONLY_JSON: ${{ steps.xml-only.outputs.sbom_json_path }}
+          XML_ONLY_XML: ${{ steps.xml-only.outputs.sbom_xml_path }}
+          WITH_DEV_COUNT: ${{ steps.with-dev.outputs.component_count }}
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Verify format selection and scoping behaviour
+          errors=0
+          if [ ! -f "${JSON_ONLY_JSON}" ]; then
+            echo "JSON-only run: JSON SBOM missing ❌"
+            errors=1
+          fi
+          case "${JSON_ONLY_JSON}" in
+            */sbom-output/custom-sbom.json) ;;
+            *)
+              echo "Custom placement not honoured: ${JSON_ONLY_JSON} ❌"
+              errors=1 ;;
+          esac
+          if [ -n "${JSON_ONLY_XML}" ]; then
+            echo "JSON-only run: unexpected XML output path ❌"
+            errors=1
+          fi
+          if [ -n "${XML_ONLY_JSON}" ]; then
+            echo "XML-only run: unexpected JSON output path ❌"
+            errors=1
+          fi
+          if [ ! -f "${XML_ONLY_XML}" ]; then
+            echo "XML-only run: XML SBOM missing ❌"
+            errors=1
+          fi
+          # Development dependency scoping must add components for the
+          # node fixture, which declares devDependencies
+          if [ "${WITH_DEV_COUNT}" -le "${JSON_ONLY_COUNT}" ]; then
+            echo "Dev scoping made no difference ❌"
+            echo "Production: ${JSON_ONLY_COUNT} components"
+            echo "With dev: ${WITH_DEV_COUNT} components"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Options verification failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Formats, scoping and placement verified ✅"
+          {
+            echo "Formats, scoping and placement verified ✅"
+            echo "Production components: ${JSON_ONLY_COUNT}"
+            echo "With development components: ${WITH_DEV_COUNT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test invalid inputs fail closed ###
+  test-failures:
+    name: "Test: invalid inputs and error handling"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@aa81113fe43792f29f939c79ea47a04801cf5342' # v0.4.1
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: "Running local action with unsupported backend"
+        id: bad-backend
+        continue-on-error: true
+        uses: ./
+        with:
+          backend: cyclonedx-npm
+
+      - name: "Running local action with invalid format"
+        id: bad-format
+        continue-on-error: true
+        uses: ./
+        with:
+          sbom_format: yaml
+
+      - name: "Running local action with missing project directory"
+        id: bad-path
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: does/not/exist
+
+      - name: "Running local action with workspace-escaping path"
+        id: escape-path
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: /etc
+
+      - name: "Running local action with escaping output directory"
+        id: escape-output
+        continue-on-error: true
+        uses: ./
+        with:
+          output_directory: /opt/escape-test
+
+      - name: "Running local action with unsafe filename prefix"
+        id: bad-prefix
+        continue-on-error: true
+        uses: ./
+        with:
+          filename_prefix: '../escape'
+
+      # An unsupported CycloneDX spec version passes input validation
+      # (digits and dots) but makes the syft scan itself fail,
+      # exercising the fail_on_error handling paths
+      - name: "Running local action with syft failure (soft fail)"
+        id: soft-fail
+        continue-on-error: true
+        uses: ./
+        with:
+          sbom_spec_version: '9.9'
+          fail_on_error: false
+
+      - name: "Running local action with syft failure (hard fail)"
+        id: hard-fail
+        continue-on-error: true
+        uses: ./
+        with:
+          sbom_spec_version: '9.9'
+
+      - name: "Verify invalid inputs were rejected"
+        shell: bash
+        env:
+          BACKEND_OUTCOME: ${{ steps.bad-backend.outcome }}
+          FORMAT_OUTCOME: ${{ steps.bad-format.outcome }}
+          PATH_OUTCOME: ${{ steps.bad-path.outcome }}
+          ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
+          OUTPUT_ESCAPE_OUTCOME: ${{ steps.escape-output.outcome }}
+          PREFIX_OUTCOME: ${{ steps.bad-prefix.outcome }}
+          HARD_FAIL_OUTCOME: ${{ steps.hard-fail.outcome }}
+          SOFT_FAIL_OUTCOME: ${{ steps.soft-fail.outcome }}
+          SOFT_FAIL_COUNT: ${{ steps.soft-fail.outputs.component_count }}
+        run: |
+          # Failure testing is also important; all steps MUST fail
+          errors=0
+          for outcome_pair in \
+            "backend:${BACKEND_OUTCOME}" \
+            "format:${FORMAT_OUTCOME}" \
+            "path:${PATH_OUTCOME}" \
+            "escape:${ESCAPE_OUTCOME}" \
+            "output-escape:${OUTPUT_ESCAPE_OUTCOME}" \
+            "prefix:${PREFIX_OUTCOME}" \
+            "hard-fail:${HARD_FAIL_OUTCOME}"; do
+            test_name="${outcome_pair%%:*}"
+            outcome="${outcome_pair#*:}"
+            if [ "${outcome}" = "success" ]; then
+              echo "Invalid ${test_name} unexpectedly succeeded ❌"
+              errors=1
+            fi
+          done
+          # With fail_on_error false, a syft failure must NOT fail the
+          # action, and component_count must report zero
+          if [ "${SOFT_FAIL_OUTCOME}" != "success" ]; then
+            echo "Soft-fail path unexpectedly failed ❌"
+            errors=1
+          fi
+          if [ "${SOFT_FAIL_COUNT}" != "0" ]; then
+            echo "Soft-fail component_count not zero ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Failure-path tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Invalid inputs correctly rejected ✅"
+          echo "Invalid inputs correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
