@@ -1,53 +1,346 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# sbom-action
+name: "📋 SBOM Generator"
+# yamllint disable-line rule:line-length
+description: "Generates CycloneDX SBOM reports for projects in any language/ecosystem"
+# Facade action: a common interface over pluggable SBOM generation
+# backends. The interface deliberately mirrors python-sbom-action so
+# callers see one contract across the actions estate. The syft backend
+# performs static analysis of lockfiles/filesystem content and covers
+# Go, Node.js, containers, binaries and many further ecosystems in a
+# single tool. Future backends (cyclonedx-npm, cyclonedx-gomod, an
+# environment-based python backend) can slot in behind the same
+# interface when evidence shows a need for them.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # Optional
+  backend:
+    description: "SBOM generation backend; currently supports 'syft'"
+    required: false
+    default: "syft"
+  path_prefix:
+    description: "Project directory; must resolve within the workspace"
+    required: false
+    default: "."
+  sbom_format:
+    description: "SBOM output format: 'json', 'xml', or 'both'"
+    required: false
+    default: "both"
+  sbom_spec_version:
+    description: "CycloneDX specification version to use"
+    required: false
+    default: "1.5"
+  filename_prefix:
+    description: "Base filename for SBOM output (without extension)"
+    required: false
+    default: "sbom-cyclonedx"
+  output_directory:
+    description: "SBOM report directory, within workspace or runner temp"
+    required: false
+    default: "."
+  include_dev:
+    description: "Include development dependencies in SBOM"
+    required: false
+    default: "false"
+  fail_on_error:
+    description: "Fail the action if SBOM generation encounters errors"
+    required: false
+    default: "true"
+  syft_version:
+    # yamllint disable-line rule:line-length
+    description: "Syft version to download (defaults to the installer's pinned version)"
+    required: false
+    default: ""
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  sbom_json_path:
+    description: "Path to generated JSON SBOM file"
+    value: ${{ steps.generate.outputs.sbom_json_path }}
+  sbom_xml_path:
+    description: "Path to generated XML SBOM file"
+    value: ${{ steps.generate.outputs.sbom_xml_path }}
+  component_count:
+    description: "Number of components in the generated SBOM"
+    value: ${{ steps.generate.outputs.component_count }}
+  backend:
+    description: "SBOM generation backend used"
+    value: ${{ steps.validate.outputs.backend }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Validate inputs"
+      id: validate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        INPUT_BACKEND: ${{ inputs.backend }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_SBOM_FORMAT: ${{ inputs.sbom_format }}
+        INPUT_SBOM_SPEC_VERSION: ${{ inputs.sbom_spec_version }}
+        INPUT_FILENAME_PREFIX: ${{ inputs.filename_prefix }}
+        INPUT_INCLUDE_DEV: ${{ inputs.include_dev }}
+        INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Validate inputs
+        # Preflight: fail with a clear message when required tools are
+        # missing (possible on minimal self-hosted runners)
+        for tool in jq realpath mktemp; do
+          if ! command -v "${tool}" > /dev/null 2>&1; then
+            echo "Error: required tool not found: ${tool} ❌"
+            echo "This action requires jq, realpath (GNU coreutils)"
+            echo "and mktemp on the runner"
+            exit 1
+          fi
+        done
+        # The action requires GNU realpath -m (missing-path
+        # resolution); BSD/macOS realpath lacks it, and failing here
+        # gives a clearer error than a mid-run failure
+        if ! realpath -m -- / > /dev/null 2>&1; then
+          echo "Error: realpath does not support the -m option ❌"
+          echo "This action requires GNU coreutils realpath"
           exit 1
         fi
-
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+        # The workspace/temp boundary checks depend on these runner
+        # environment variables: an empty value would degrade the
+        # case patterns to /* and disable the escape checks
+        for dir_var in GITHUB_WORKSPACE RUNNER_TEMP; do
+          dir_value="${!dir_var:-}"
+          if [ -z "${dir_value}" ] || [ ! -d "${dir_value}" ]; then
+            echo "Error: ${dir_var} not set to a directory ❌"
+            echo "This action requires a standard runner environment"
+            exit 1
+          fi
         done
+        case "${INPUT_BACKEND}" in
+          syft) ;;
+          *)
+            echo "Error: unsupported backend ❌"
+            echo "Supported backends: syft"
+            exit 1 ;;
+        esac
+        case "${INPUT_SBOM_FORMAT}" in
+          json|xml|both) ;;
+          *)
+            echo "Error: sbom_format must be 'json', 'xml' or 'both' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_INCLUDE_DEV}" in
+          true|false) ;;
+          *)
+            echo "Error: include_dev must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_FAIL_ON_ERROR}" in
+          true|false) ;;
+          *)
+            echo "Error: fail_on_error must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        # A case glob validates the entire string, including embedded
+        # newlines; grep would only validate per line
+        case "${INPUT_SBOM_SPEC_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid sbom_spec_version ❌"
+            echo "Expected a CycloneDX version such as 1.5 or 1.6"
+            exit 1 ;;
+        esac
+        # Restrict the filename prefix to a safe character set so it
+        # cannot alter paths or inject into downstream commands
+        case "${INPUT_FILENAME_PREFIX}" in
+          *[!A-Za-z0-9._-]*|'')
+            echo "Error: invalid filename_prefix ❌"
+            echo "Allowed characters: A-Z a-z 0-9 . _ -"
+            exit 1 ;;
+        esac
+        # Anchor relative paths to GITHUB_WORKSPACE: composite
+        # actions can run with a caller-set working directory, so
+        # resolving against the current directory would be
+        # non-deterministic
+        case "${INPUT_PATH_PREFIX}" in
+          /*) project_dir="${INPUT_PATH_PREFIX}" ;;
+          *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
+        esac
+        if [ ! -d "${project_dir}" ]; then
+          echo "Error: invalid project directory ❌"
+          # Strip CR/LF before logging the untrusted path: embedded
+          # newlines could otherwise inject workflow commands via the
+          # log stream
+          printf 'Path not found: %s\n' \
+            "$(printf '%s' "${project_dir}" | tr -d '\r\n')"
+          exit 1
+        fi
+        # Restrict scanning to the workspace: an absolute or escaped
+        # path could otherwise expose runner filesystem details in the
+        # SBOM and any uploaded artifacts
+        resolved="$(realpath -- "${project_dir}")"
+        workspace="$(realpath -- "${GITHUB_WORKSPACE}")"
+        case "${resolved}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        echo "backend=${INPUT_BACKEND}" >> "$GITHUB_OUTPUT"
+
+    - name: "Download syft"
+      id: syft
+      # yamllint disable-line rule:line-length
+      uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      with:
+        syft-version: ${{ inputs.syft_version }}
+
+    - name: "Generate SBOM"
+      id: generate
+      shell: bash
+      env:
+        SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        SBOM_FORMAT: ${{ inputs.sbom_format }}
+        SPEC_VERSION: ${{ inputs.sbom_spec_version }}
+        FILENAME_PREFIX: ${{ inputs.filename_prefix }}
+        OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
+        INCLUDE_DEV: ${{ inputs.include_dev }}
+        FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        # Maps the include_dev input onto syft's JavaScript cataloger;
+        # further per-ecosystem scoping options join here as syft
+        # exposes them
+        SYFT_JAVASCRIPT_INCLUDE_DEV_DEPENDENCIES: ${{ inputs.include_dev }}
+      run: |
+        # Generate SBOM
+        # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
+        # deterministic when the caller sets a working directory. The
+        # :? expansions hard-fail on unset/empty runner variables,
+        # which would otherwise weaken the boundary checks below
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        # Re-resolve and enforce the workspace boundary at the point
+        # of use: the workspace is mutable between steps, so relying
+        # solely on the earlier validate step would leave a TOCTOU
+        # gap (a validated directory swapped for an escaping symlink)
+        PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")"
+        boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")"
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        # Convert the output directory to an absolute path anchored
+        # to GITHUB_WORKSPACE. Resolution (realpath -m) happens BEFORE
+        # any mkdir, and the boundary check applies in ALL cases: the
+        # resolved path must sit within GITHUB_WORKSPACE or
+        # RUNNER_TEMP, as writing elsewhere on the runner filesystem
+        # is an operational/security risk
+        if [ -z "${OUTPUT_DIRECTORY}" ]; then
+          OUTPUT_DIRECTORY="."
+        fi
+        case "${OUTPUT_DIRECTORY}" in
+          /*) ;;
+          *) OUTPUT_DIRECTORY="${GITHUB_WORKSPACE}/${OUTPUT_DIRECTORY}" ;;
+        esac
+        OUTPUT_DIR="$(realpath -m -- "${OUTPUT_DIRECTORY}")"
+        workspace="$(realpath -- "${GITHUB_WORKSPACE:?}")"
+        temp_dir="$(realpath -- "${RUNNER_TEMP:?}")"
+        case "${OUTPUT_DIR}/" in
+          "${workspace}/"*|"${temp_dir}/"*) ;;
+          *)
+            echo "Error: output directory escapes the workspace ❌"
+            echo "output_directory must resolve within"
+            echo "GITHUB_WORKSPACE or RUNNER_TEMP"
+            exit 1 ;;
+        esac
+        mkdir -p -- "${OUTPUT_DIR}"
+
+        json_path="${OUTPUT_DIR}/${FILENAME_PREFIX}.json"
+        xml_path="${OUTPUT_DIR}/${FILENAME_PREFIX}.xml"
+
+        # Build the syft output arguments. A JSON document always
+        # gets generated because the component count derives from it.
+        # For xml-only runs the JSON is a transient scratch file under
+        # RUNNER_TEMP, removed on step exit and NOT exposed through
+        # outputs: downstream consumers (such as a Grype audit job)
+        # can only rely on the JSON document when the caller requests
+        # the json or both formats
+        if [ "${SBOM_FORMAT}" = "xml" ]; then
+          scratch_dir="$(mktemp -d "${RUNNER_TEMP}/sbom.XXXXXX")"
+          # Remove the scratch directory on step exit: RUNNER_TEMP is
+          # not always cleaned between runs on self-hosted runners
+          trap 'rm -rf -- "${scratch_dir}"' EXIT
+          json_path="${scratch_dir}/${FILENAME_PREFIX}.json"
+        fi
+        set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_path}"
+        if [ "${SBOM_FORMAT}" = "xml" ] || \
+          [ "${SBOM_FORMAT}" = "both" ]; then
+          set -- "$@" -o "cyclonedx-xml@${SPEC_VERSION}=${xml_path}"
+        fi
+
+        echo "Generating SBOM with syft (dev dependencies:" \
+          "${INCLUDE_DEV})"
+        set +e
+        "${SYFT_CMD}" scan "dir:${PROJECT_DIR}" -q "$@"
+        syft_exit=$?
+        set -e
+
+        if [ "${syft_exit}" != "0" ]; then
+          echo "Syft exited with code ${syft_exit}"
+          {
+            echo "## 📋 SBOM Generation Results"
+            echo ""
+            echo "SBOM generation failed (syft exit ${syft_exit}) ❌"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${FAIL_ON_ERROR}" = "true" ]; then
+            echo "::error::SBOM generation failed ❌"
+            exit 1
+          fi
+          echo "::warning::SBOM generation failed; continuing" \
+            "(fail_on_error: false)"
+          echo "component_count=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        component_count=$(jq '.components // [] | length' "${json_path}")
+
+        # Emit outputs; paths only for the formats the caller requested.
+        # Path values derive from the caller-controlled output_directory
+        # and can legally contain newlines, so they use the multiline
+        # heredoc output format with a random delimiter (built from
+        # shell-builtin randomness, regenerated until provably absent
+        # from the value) to prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        if [ "${SBOM_FORMAT}" != "xml" ]; then
+          emit_output "sbom_json_path" "${json_path}"
+        fi
+        if [ "${SBOM_FORMAT}" != "json" ]; then
+          emit_output "sbom_xml_path" "${xml_path}"
+        fi
+        echo "component_count=${component_count}" >> "$GITHUB_OUTPUT"
+
+        echo "SBOM generation complete: ${component_count} components ✅"
         {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 📋 SBOM Generation Results"
+          echo ""
+          echo "**Backend:** syft"
+          echo "**Format:** ${SBOM_FORMAT}"
+          echo "**Specification Version:** ${SPEC_VERSION}"
+          echo "**Development Dependencies:** ${INCLUDE_DEV}"
+          echo "**Components Found:** ${component_count}"
+        } >> "$GITHUB_STEP_SUMMARY"
